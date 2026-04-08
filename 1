@@ -1,4 +1,435 @@
-Create a JSON schema file for the DAPortal SchemaDriven pipeline.
+# DAPortal - Testing Plan
+
+**Target:** DAPortal deployed in client environment (Bakery GitLab / VDI)
+**Mode tested:** SchemaDriven (governance-driven masking)
+**Baseline reference:** `portal-observations.md` (full portal documentation)
+
+---
+
+## Table of Contents
+
+1. [Prerequisites](#1-prerequisites)
+2. [Open Questions - Ask the Architect Before Testing](#2-open-questions---ask-the-architect-before-testing)
+3. [Test File Inventory](#3-test-file-inventory)
+4. [Test Scenarios](#4-test-scenarios)
+   - [S01 - Clean data, no PII](#s01---clean-data-no-pii)
+   - [S02 - HR data, all PII properly masked](#s02---hr-data-all-pii-properly-masked)
+   - [S03 - Bakery identifiers](#s03---bakery-identifiers)
+   - [S04 - PII survives masking, medium confidence](#s04---pii-survives-masking-medium-confidence)
+   - [S05 - PII survives masking, high confidence](#s05---pii-survives-masking-high-confidence)
+   - [S06 - Missing schema file](#s06---missing-schema-file)
+   - [S07 - Invalid schema file](#s07---invalid-schema-file)
+   - [S08 - Wrong file format](#s08---wrong-file-format)
+   - [S09 - Bypass governance](#s09---bypass-governance)
+   - [S10 - Deterministic masking verification](#s10---deterministic-masking-verification)
+5. [File Generation Prompts](#5-file-generation-prompts)
+
+---
+
+## 1. Prerequisites
+
+Before running any scenario:
+
+- [ ] Access to DAPortal via VDI confirmed
+- [ ] Requester role assigned in Entra for your account
+- [ ] Data Admin role assigned in Entra for approval steps
+- [ ] Target sandbox ID confirmed (e.g., `sandbox-001` or equivalent)
+- [ ] All test files listed in Section 3 are created and saved locally
+- [ ] Azure Storage Explorer access for post-test blob inspection (optional but recommended)
+- [ ] Ask the architect the questions in Section 2 before testing - some answers affect expected outcomes
+
+---
+
+## 2. Open Questions - Ask the Architect Before Testing
+
+These are unresolved questions that may affect test outcomes or what you observe.
+
+| # | Question | Why it matters for testing |
+|---|---|---|
+| Q1 | Is there container-level RBAC isolation per request, or only blob path prefix isolation? | Affects security validation of S01-S05 |
+| Q2 | Are upload SAS tokens time-limited? Are permissions revoked after request completes? | Affects post-test cleanup expectations |
+| Q3 | Is the uploader's Entra identity validated against the target sandbox AD group before the request is accepted? | Affects whether a wrong-sandbox test is needed |
+| Q4 | If validation fails, masking fails, or PII scan throws an exception (not findings - an actual error) - is the uploaded file immediately deleted? | Determines whether S06/S07/S08 produce clean failures |
+| Q5 | Is there a 72-hour SLA timer on pending-approval requests? What happens automatically if no decision is made? | Affects S02/S03/S04 approval step observation |
+| Q8 | Is the approval reason/justification captured anywhere - e.g. in a review_report blob in storage? | Affects what to check in S02/S03 post-approval |
+| Q9 | Is there any metadata or governance context captured for each request beyond sandbox_id and mode? Does Entra profile data (name, email) get auto-captured? | Affects audit trail completeness check in all scenarios |
+| Q11 | What notification service sends the approval emails? | Informational - check notification admin settings before testing |
+| Q13 | Is there a schema template or example file provided to requesters anywhere in the portal? | Affects S06/S07 (should a template be downloaded first?) |
+| Q14 | After masking is applied, is the original unmasked file permanently and irreversibly deleted? Or is it archived somewhere? | Confirms delete_original step completes cleanly |
+
+---
+
+## 3. Test File Inventory
+
+All files should be saved in your local test folder before testing.
+Schema files use the DAPortal `SchemaDriven` format: `{ "format": "csv", "columns": [...] }`
+
+**Note on piiType values:** All schema files use the official Bakery PI taxonomy
+confirmed by the Data Governance team. Valid values are:
+`GOVERNMENT_IDENTIFIERS`, `MEDICAL_INFORMATION`, `FINANCIAL`, `BIOMETRIC`,
+`GEOLOCATION`, `BACKGROUND_INFORMATION`, `BROWSING_INFORMATION`, `BEHAVIOURAL_PURCHASING`,
+`CONTACT_INFORMATION_PERSONAL`, `DEMOGRAPHIC_INFORMATION`, `EMPLOYMENT_INFORMATION`,
+`FAMILY_INFORMATION`, `LIFE_EVENTS`, `PERSONAL_IDENTIFICATION`, `TRAVEL_EXPENSE`,
+`USER_ACCOUNT_INFORMATION`, `EDUCATION_SKILLS`, `PRODUCT_INFORMATION`, `PROFESSIONAL_EXPERIENCE`
+
+| File | Type | Status | Used in scenarios |
+|---|---|---|---|
+| `no_pii_clean.csv` | CSV | EXISTS in `test-files/sprint2/` | S01 |
+| `no_pii_clean.schema.json` | Schema | **CREATE** | S01 |
+| `hr_sample.csv` | CSV | EXISTS in `test-files/sprint2/` as `canadian_hr_sample.csv` | S02, S06, S09, S10 |
+| `hr_sample.schema.json` | Schema | **CREATE** | S02, S09, S10 |
+| `bakery_ids_sample.csv` | CSV | EXISTS in `test-files/sprint2/` as `canada_life_ids_sample.csv` | S03 |
+| `bakery_ids_sample.schema.json` | Schema | **CREATE** | S03 |
+| `pii_leaks_test.csv` | CSV | **CREATE** | S04, S05 |
+| `pii_leaks_medium_confidence.schema.json` | Schema | **CREATE** | S04 |
+| `pii_leaks_high_confidence.schema.json` | Schema | **CREATE** | S05 |
+| `invalid.schema.json` | Schema | **CREATE** | S07 |
+| `wrong_format.xlsx` | Excel | **CREATE** | S08 |
+
+**Total: 3 existing files (CSVs), 8 files to create**
+
+Generation prompts for all 8 new files are in Section 5.
+
+---
+
+## 4. Test Scenarios
+
+---
+
+### S01 - Clean data, no PII
+
+**Purpose:** Verify the happy path for clean data - pipeline completes, no PII found, file delivered.
+
+**Files:**
+- Artifact: `no_pii_clean.csv`
+- Schema: `no_pii_clean.schema.json`
+
+**Steps:**
+1. Log into DAPortal as Requester
+2. Click "New Request" → select DATA lane
+3. Confirm mode is SchemaDriven
+4. Enter sandbox ID
+5. Upload `no_pii_clean.schema.json` as the schema file
+6. Upload `no_pii_clean.csv` as the artifact
+7. Submit the request
+
+**Expected results:**
+- Request created, request ID assigned (e.g., `dair-XXXXXXXX`)
+- Pipeline auto-triggers (no manual step)
+- Audit log shows: `create_request` → `upload_schema` → `upload_artifact` → `delete_original` → `execute_pii_scan` → `submit_for_approval`
+- `execute_pii_scan` result: `TOTAL_FINDINGS: 0`, `RECOMMENDED_ACTION: pending_approval` (or auto-approve if portal has a no-findings fast path)
+- Request appears in Data Admin queue for approval
+- After approval: `move_to_sandbox` → file appears in sandbox
+
+**What to check in storage after approval:**
+- Masked file exists in sandbox container (product catalog data should be unchanged - no columns had piiType)
+- `delete_original` completed - no unmasked copy in landing
+
+**Log if different:** Any extra audit steps, different action names, or unexpected routing.
+
+---
+
+### S02 - HR data, all PII properly masked
+
+**Purpose:** Verify the standard masking path - all PII columns are tokenized, post-masking PII scan finds nothing or low confidence.
+
+**Files:**
+- Artifact: `hr_sample.csv`
+- Schema: `hr_sample.schema.json`
+
+**Steps:**
+1. Log into DAPortal as Requester
+2. Click "New Request" → DATA lane, SchemaDriven mode
+3. Enter sandbox ID
+4. Upload `hr_sample.schema.json` as the schema file
+5. Upload `hr_sample.csv` as the artifact
+6. Submit
+
+**Expected results:**
+- Audit log shows full pipeline: create → schema upload → artifact upload → delete_original → PII scan → submit_for_approval
+- `execute_pii_scan` on the **masked** file: findings should be 0 or very low confidence (tokenized values should not trigger Presidio)
+- `RECOMMENDED_ACTION: pending_approval`
+- Data Admin approves
+- `move_to_sandbox` succeeds
+- Masked file in sandbox: `name`, `email`, `phone`, `sin`, `postal_code` columns all tokenized (values replaced with opaque tokens)
+
+**What to check in storage:**
+- Masked output CSV - confirm PII columns contain token values, not original data
+- `department` column retained (no piiType assigned)
+- If review_report blob exists in storage, open it and note what it contains (answers Q8)
+
+**Log if different:** Any columns unexpectedly retained, any scan findings on masked data.
+
+---
+
+### S03 - Bakery identifiers
+
+**Purpose:** Verify custom Presidio recognizers detect Bakery-specific identifiers (policy numbers, employee IDs, member IDs).
+
+**Files:**
+- Artifact: `bakery_ids_sample.csv`
+- Schema: `bakery_ids_sample.schema.json`
+
+**Steps:**
+1. Log into DAPortal as Requester
+2. New Request → DATA lane, SchemaDriven
+3. Enter sandbox ID
+4. Upload `bakery_ids_sample.schema.json`
+5. Upload `bakery_ids_sample.csv`
+6. Submit
+
+**Expected results:**
+- Masking applied: `identifier` column tokenized (piiType = `USER_ACCOUNT_INFORMATION`)
+- Post-masking PII scan runs on the masked file
+- Custom recognizers `BAKERY_POLICY_NUMBER` (0.78), `BAKERY_EMPLOYEE_ID` (0.76), `BAKERY_MEMBER_ID` (0.76) should fire on the `notes` column since it contains raw identifier references in free text - and `notes` is listed in schema with piiType so it should also be tokenized
+- If all columns are properly masked: scan finds nothing → pending_approval
+- If `notes` column tokenization does not catch embedded identifiers in text: scan may find residual at 0.76-0.78 → still pending_approval (below 0.90 auto-reject threshold)
+
+**Note:** Policy number format in test data is `P1234567` (placeholder format - governance has not confirmed production format). If scanner does not fire on these, the custom recognizer pattern may not match real formats.
+
+**What to record:**
+- Which entity types did the scanner find (if any)? What confidence?
+- Did `BAKERY_POLICY_NUMBER`, `BAKERY_EMPLOYEE_ID`, `BAKERY_MEMBER_ID` fire?
+- This test validates whether custom recognizers are still active or were changed
+
+---
+
+### S04 - PII survives masking, medium confidence
+
+**Purpose:** Verify that PII detected at medium confidence (0.70-0.89) routes to human review, not auto-reject.
+
+**Background:** `pii_leaks_test.csv` has two columns not covered by masking rules:
+- `contact_backup` - raw email addresses
+- `employee_sin` - raw SIN values
+
+`pii_leaks_medium_confidence.schema.json` maps `contact_backup` for masking but **intentionally omits `employee_sin`**. After masking, `employee_sin` remains raw. SIN recognizer fires at 0.85 → human review.
+
+**Files:**
+- Artifact: `pii_leaks_test.csv`
+- Schema: `pii_leaks_medium_confidence.schema.json`
+
+**Steps:**
+1. New Request → DATA lane, SchemaDriven
+2. Enter sandbox ID
+3. Upload `pii_leaks_medium_confidence.schema.json`
+4. Upload `pii_leaks_test.csv`
+5. Submit
+
+**Expected results:**
+- Masking applies to columns listed in schema (`name`, `contact_backup`)
+- `employee_sin` column is NOT masked (not in schema)
+- Post-masking scan: `CA_SOCIAL_INSURANCE_NUMBER` fires at ~0.85
+- `RECOMMENDED_ACTION: pending_approval` (0.85 is between 0.70 and 0.90 - human review threshold)
+- Request appears in Data Admin queue
+- **Do NOT approve** - observe that the queue entry exists and record what the Data Admin sees
+
+**What to record:**
+- Exact MAX_CONFIDENCE value in audit
+- What the Data Admin view shows for a pending-approval request (column names? confidence? entity types?)
+- Is there enough information for a Data Admin to make an informed decision?
+
+---
+
+### S05 - PII survives masking, high confidence
+
+**Purpose:** Verify that PII detected at high confidence (>=0.90) is auto-rejected without human review.
+
+**Background:** `pii_leaks_high_confidence.schema.json` maps `employee_sin` for masking but **intentionally omits `contact_backup`**. After masking, `contact_backup` remains raw (real email addresses). Email recognizer fires at ~1.0 → auto-reject.
+
+**Files:**
+- Artifact: `pii_leaks_test.csv` (same CSV as S04)
+- Schema: `pii_leaks_high_confidence.schema.json`
+
+**Steps:**
+1. New Request → DATA lane, SchemaDriven
+2. Enter sandbox ID
+3. Upload `pii_leaks_high_confidence.schema.json`
+4. Upload `pii_leaks_test.csv`
+5. Submit
+
+**Expected results:**
+- Masking applies to `name`, `employee_sin` (listed in schema)
+- `contact_backup` is NOT masked (not in schema) - raw emails remain
+- Post-masking scan: `EMAIL_ADDRESS` fires at ~1.0
+- `RECOMMENDED_ACTION: rejected` (>=0.90 auto-reject threshold)
+- Request does NOT appear in Data Admin queue
+- Audit shows rejection without human review step
+- File is deleted - does NOT reach sandbox
+
+**What to record:**
+- Exact audit action name for auto-reject (e.g., `auto_reject`, `reject_request`?)
+- Is the requester notified of auto-rejection? (check email if notifications are configured)
+- Is the unmasked file deleted immediately?
+
+---
+
+### S06 - Missing schema file
+
+**Purpose:** Verify the pipeline rejects a request submitted without a schema file.
+
+**Files:**
+- Artifact: `hr_sample.csv`
+- Schema: none (intentionally not uploaded)
+
+**Steps:**
+1. New Request → DATA lane, SchemaDriven
+2. Enter sandbox ID
+3. Skip the schema upload step (do not upload any schema)
+4. Upload `hr_sample.csv` as artifact
+5. Attempt to submit
+
+**Expected results - Option A (UI prevents submission):**
+- Portal UI shows a validation error and does not allow submission without a schema
+- No request ID created
+
+**Expected results - Option B (server-side validation):**
+- Request is created but fails at schema validation step
+- Audit shows: `create_request` → `upload_artifact` → `validation_failed` (or similar)
+- File is deleted (fail-closed)
+
+**What to record:**
+- Which option applies - UI or server validation?
+- Exact error message shown
+- Is the uploaded CSV deleted?
+
+---
+
+### S07 - Invalid schema file
+
+**Purpose:** Verify the pipeline rejects a schema file that does not conform to the expected format.
+
+**Files:**
+- Artifact: `hr_sample.csv`
+- Schema: `invalid.schema.json`
+
+**Steps:**
+1. New Request → DATA lane, SchemaDriven
+2. Enter sandbox ID
+3. Upload `invalid.schema.json` as the schema file
+4. Upload `hr_sample.csv` as artifact
+5. Submit
+
+**Expected results:**
+- Pipeline rejects the request at schema validation
+- Audit shows validation failure
+- Neither file proceeds to masking stage
+- Files deleted (fail-closed)
+
+**What to record:**
+- At which stage does rejection occur (UI, schema upload step, or after artifact upload)?
+- Exact audit action and error message
+- Are files deleted?
+
+---
+
+### S08 - Wrong file format
+
+**Purpose:** Verify the pipeline rejects a non-CSV artifact at the format validation gate.
+
+**Files:**
+- Artifact: `wrong_format.xlsx`
+- Schema: `hr_sample.schema.json` (valid schema, to isolate the format failure)
+
+**Steps:**
+1. New Request → DATA lane, SchemaDriven
+2. Enter sandbox ID
+3. Upload `hr_sample.schema.json` as schema
+4. Upload `wrong_format.xlsx` as artifact
+5. Submit (if UI allows it)
+
+**Expected results:**
+- Pipeline rejects at format validation
+- Audit shows format validation failure
+- File deleted
+
+**What to record:**
+- Does the UI prevent xlsx upload (file picker restriction), or does it accept it and fail server-side?
+- Exact error / audit entry
+- Is the xlsx file deleted?
+
+---
+
+### S09 - Bypass governance
+
+**Purpose:** Verify the bypass path works - a request with `BYPASS_DATA_GOVERNANCE = true` skips masking and PII scan and goes directly to approval.
+
+**Files:**
+- Artifact: `hr_sample.csv`
+- Schema: `hr_sample.schema.json`
+
+**Steps:**
+1. New Request → DATA lane, SchemaDriven
+2. Enter sandbox ID
+3. **Enable the bypass flag** in the request creation form (checkbox or toggle - confirm with the architect where this is)
+4. Note the DPIA reference field if visible - enter a reference number (e.g., `DPIA-2026-001`)
+5. Upload `hr_sample.schema.json`
+6. Upload `hr_sample.csv`
+7. Submit
+
+**Expected results:**
+- Audit shows: `create_request` with `BYPASS_DATA_GOVERNANCE: true`
+- Masking step is skipped (no `delete_original` in audit)
+- PII scan step is skipped
+- Goes directly to approval queue
+- After Data Admin approval: raw unmasked file delivered to sandbox
+
+**What to record:**
+- Exact audit sequence (which steps are present/absent)
+- Is the DPIA reference captured in audit?
+- Is the bypassed request visually distinct in the Data Admin approval queue?
+- Does the Data Admin see a warning that masking was bypassed?
+
+---
+
+### S10 - Deterministic masking verification
+
+**Purpose:** Verify that masking is deterministic - the same input value always produces the same masked output token, across separate requests and runs.
+
+**Files:**
+- Artifact: `hr_sample.csv` (same file, used twice)
+- Schema: `hr_sample.schema.json` (same file, used twice)
+
+**Steps:**
+1. Complete S02 first (or run a fresh request with these files) - this is Run A
+2. Note the request ID from Run A
+3. Submit an identical second request with the same files - this is Run B
+4. Note the request ID from Run B
+5. After both requests are approved and delivered, open Azure Storage Explorer
+6. Navigate to the sandbox container, find the masked output files from both runs
+7. Download both masked CSV files
+8. Compare the masked values column by column:
+   - `name` column: are tokens identical across both runs?
+   - `email` column: are tokens identical?
+   - `sin` column: are tokens identical?
+   - `phone` column: are tokens identical?
+
+**Expected results (if masking IS deterministic):**
+- `alex.martin@bakery.com` → same token in both outputs
+- `234-567-890` (SIN) → same token in both outputs
+- Every row, every masked column: identical tokens
+
+**Expected results (if masking is NOT deterministic):**
+- Tokens differ between Run A and Run B for the same input value
+- This would be a governance concern for cross-file joins
+
+**What to record:**
+- Side-by-side comparison of at least 3 values from each masked column
+- Pass/fail per column
+- Note the date/time of both runs and which Key Vault key version was active (if visible)
+
+---
+
+## 5. File Generation Prompts
+
+Use these prompts with Claude (GitLab or any Claude instance) to generate each file.
+Paste the prompt as-is - all necessary context is included.
+
+---
+
+### PROMPT 1 - `no_pii_clean.schema.json`
+
+```
+Create a JSON schema file for the DAPortal SchemaDriven pipeline at Bakery.
 
 File name: no_pii_clean.schema.json
 
@@ -15,8 +446,278 @@ The DAPortal schema file format is:
 }
 
 For columns with no PII, set piiType to empty string "".
-Valid pllType values are from the following taxonomy:
-skdjfhkjsfh
+Valid piiType values are from the Bakery PI taxonomy:
+GOVERNMENT_IDENTIFIERS, MEDICAL_INFORMATION, FINANCIAL, BIOMETRIC, GEOLOCATION,
+BACKGROUND_INFORMATION, BROWSING_INFORMATION, BEHAVIOURAL_PURCHASING,
+CONTACT_INFORMATION_PERSONAL, DEMOGRAPHIC_INFORMATION, EMPLOYMENT_INFORMATION,
+FAMILY_INFORMATION, LIFE_EVENTS, PERSONAL_IDENTIFICATION, TRAVEL_EXPENSE,
+USER_ACCOUNT_INFORMATION, EDUCATION_SKILLS, PRODUCT_INFORMATION, PROFESSIONAL_EXPERIENCE
 
 Include all 6 columns in the schema. All should have piiType "".
 Output only the JSON file content, no explanation.
+```
+
+---
+
+### PROMPT 2 - `hr_sample.schema.json`
+
+```
+Create a JSON schema file for the DAPortal SchemaDriven pipeline at Bakery.
+
+File name: hr_sample.schema.json
+
+This schema file accompanies an HR sample CSV called hr_sample.csv.
+The CSV has these columns: id, name, email, phone, sin, postal_code, department.
+
+The DAPortal schema file format is:
+{
+  "format": "csv",
+  "columns": [
+    { "columnName": "<name>", "piiType": "<taxonomy value or empty string>" }
+  ]
+}
+
+Column piiType mapping using the official Bakery PI taxonomy:
+- id: not PII, use ""
+- name: PERSONAL_IDENTIFICATION
+- email: CONTACT_INFORMATION_PERSONAL
+- phone: CONTACT_INFORMATION_PERSONAL
+- sin: GOVERNMENT_IDENTIFIERS
+- postal_code: CONTACT_INFORMATION_PERSONAL
+- department: not PII, use ""
+
+Valid piiType values from the Bakery PI taxonomy are:
+GOVERNMENT_IDENTIFIERS, MEDICAL_INFORMATION, FINANCIAL, BIOMETRIC, GEOLOCATION,
+BACKGROUND_INFORMATION, BROWSING_INFORMATION, BEHAVIOURAL_PURCHASING,
+CONTACT_INFORMATION_PERSONAL, DEMOGRAPHIC_INFORMATION, EMPLOYMENT_INFORMATION,
+FAMILY_INFORMATION, LIFE_EVENTS, PERSONAL_IDENTIFICATION, TRAVEL_EXPENSE,
+USER_ACCOUNT_INFORMATION, EDUCATION_SKILLS, PRODUCT_INFORMATION, PROFESSIONAL_EXPERIENCE
+
+Include all 7 columns. Output only the JSON file content, no explanation.
+```
+
+---
+
+### PROMPT 3 - `bakery_ids_sample.schema.json`
+
+```
+Create a JSON schema file for the DAPortal SchemaDriven pipeline at Bakery.
+
+File name: bakery_ids_sample.schema.json
+
+This schema file accompanies a CSV called bakery_ids_sample.csv.
+The CSV has these columns: record_id, record_type, identifier, notes.
+
+Column descriptions:
+- record_id: synthetic row identifier, not PII
+- record_type: type label (policy/employee/member), not PII
+- identifier: contains Bakery internal identifiers (policy numbers like P1234567, employee IDs like EMP-100001, member IDs like MEM-10000001) - these are internal account identifiers
+- notes: free text field that may contain references to identifiers - treat as user account information
+
+The DAPortal schema file format is:
+{
+  "format": "csv",
+  "columns": [
+    { "columnName": "<name>", "piiType": "<taxonomy value or empty string>" }
+  ]
+}
+
+Column piiType mapping using the official Bakery PI taxonomy:
+- record_id: not PII, use ""
+- record_type: not PII, use ""
+- identifier: USER_ACCOUNT_INFORMATION
+- notes: USER_ACCOUNT_INFORMATION
+
+Note: USER_ACCOUNT_INFORMATION is the closest current taxonomy category for internal
+identifiers like policy numbers and employee IDs. Subcategory granularity for
+Bakery-specific identifiers is under discussion with the Data Governance team.
+
+Include all 4 columns. Output only the JSON file content, no explanation.
+```
+
+---
+
+### PROMPT 4 - `pii_leaks_test.csv`
+
+```
+Create a synthetic CSV test file for security testing of a data masking pipeline at Bakery.
+
+File name: pii_leaks_test.csv
+
+Purpose: This file is used to test what happens when PII is NOT fully masked because
+some columns are intentionally left out of the schema file. The file contains:
+- Some columns that will be properly masked (name)
+- A column contact_backup with real email addresses (used to test auto-reject when not masked)
+- A column employee_sin with Social Insurance Numbers (used to test human review when not masked)
+- A column department with no PII
+
+Requirements:
+- 5 rows of data
+- Synthetic names and email addresses
+- Email addresses should be in standard format (e.g., firstname.lastname@bakery.com)
+- SINs should be in format XXX-XXX-XXX. First digit must not be 0 or 8.
+  Use values: 234-567-890, 345-678-901, 456-789-012, 567-890-123, 123-456-789
+- Columns: id, name, contact_backup, employee_sin, department
+
+Use these 5 people:
+  1, Alex Martin, alex.martin@bakery.com, 234-567-890, HR
+  2, Sarah Wilson, sarah.wilson@bakery.com, 345-678-901, IT
+  3, Michael Brown, michael.brown@bakery.com, 456-789-012, Finance
+  4, Aisha Okafor, aisha.okafor@bakery.com, 567-890-123, Claims
+  5, David Chen, david.chen@bakery.com, 123-456-789, IT
+
+Output only the CSV content with header row, no explanation.
+```
+
+---
+
+### PROMPT 5 - `pii_leaks_medium_confidence.schema.json`
+
+```
+Create a JSON schema file for the DAPortal SchemaDriven pipeline at Bakery.
+
+File name: pii_leaks_medium_confidence.schema.json
+
+This schema file is used for security testing. It accompanies pii_leaks_test.csv which has columns:
+id, name, contact_backup, employee_sin, department
+
+IMPORTANT INTENTIONAL DESIGN: This schema intentionally omits employee_sin from masking.
+The purpose is to test that the post-masking PII scanner detects unmasked SINs and routes
+the request to human review (not auto-reject). The SIN recognizer fires at 0.85
+confidence, which is above the human-review threshold (0.70) but below the auto-reject
+threshold (0.90).
+
+The DAPortal schema file format is:
+{
+  "format": "csv",
+  "columns": [
+    { "columnName": "<name>", "piiType": "<taxonomy value or empty string>" }
+  ]
+}
+
+Column mapping:
+- id: not PII, use ""
+- name: PERSONAL_IDENTIFICATION (will be masked)
+- contact_backup: CONTACT_INFORMATION_PERSONAL (will be masked - emails will be tokenized)
+- employee_sin: DO NOT INCLUDE THIS COLUMN in the schema at all (intentionally omitted so SINs are not masked and will be detected by the scanner)
+- department: not PII, use ""
+
+Include only 4 columns (omit employee_sin entirely). Output only the JSON file content, no explanation.
+```
+
+---
+
+### PROMPT 6 - `pii_leaks_high_confidence.schema.json`
+
+```
+Create a JSON schema file for the DAPortal SchemaDriven pipeline at Bakery.
+
+File name: pii_leaks_high_confidence.schema.json
+
+This schema file is used for security testing. It accompanies pii_leaks_test.csv which has columns:
+id, name, contact_backup, employee_sin, department
+
+IMPORTANT INTENTIONAL DESIGN: This schema intentionally omits contact_backup from masking.
+The purpose is to test that the post-masking PII scanner detects unmasked email addresses
+and auto-rejects the request without human review. The EMAIL_ADDRESS recognizer
+fires at approximately 1.0 confidence, which is above the auto-reject threshold (0.90).
+
+The DAPortal schema file format is:
+{
+  "format": "csv",
+  "columns": [
+    { "columnName": "<name>", "piiType": "<taxonomy value or empty string>" }
+  ]
+}
+
+Column mapping:
+- id: not PII, use ""
+- name: PERSONAL_IDENTIFICATION (will be masked)
+- contact_backup: DO NOT INCLUDE THIS COLUMN in the schema at all (intentionally omitted so raw email addresses survive masking and trigger auto-reject)
+- employee_sin: GOVERNMENT_IDENTIFIERS (will be masked)
+- department: not PII, use ""
+
+Include only 4 columns (omit contact_backup entirely). Output only the JSON file content, no explanation.
+```
+
+---
+
+### PROMPT 7 - `invalid.schema.json`
+
+```
+Create an intentionally malformed JSON schema file for testing validation failure
+in the DAPortal pipeline at Bakery.
+
+File name: invalid.schema.json
+
+Purpose: This file should be rejected by the pipeline's schema validation. It is used to
+verify that the portal correctly detects and rejects invalid schema files before processing begins.
+
+The valid DAPortal schema format is:
+{
+  "format": "csv",
+  "columns": [
+    { "columnName": "<name>", "piiType": "<valid taxonomy value>" }
+  ]
+}
+
+Make this file invalid in the following ways:
+1. Use "format": "excel" (unsupported format value)
+2. Include a column with a completely invalid piiType value: "piiType": "FULL_NAME" (not a valid taxonomy value - old format that was replaced)
+3. Include a column missing the required columnName field entirely (just has piiType)
+4. Include a misspelled key: "coloumns" instead of "columns" at the top level
+
+These errors simulate a requester using an outdated or incorrect template.
+
+Output only the JSON file content, no explanation.
+```
+
+---
+
+### PROMPT 8 - `wrong_format.xlsx`
+
+```
+Create a minimal Excel (.xlsx) file for format validation testing of the DAPortal pipeline at Bakery.
+
+File name: wrong_format.xlsx
+
+Purpose: This file should be rejected by the pipeline because the portal only accepts
+CSV format artifacts. It is used to verify that non-CSV file uploads are blocked.
+
+Content: A simple spreadsheet with these columns:
+id, name, email, phone, sin, postal_code, department
+
+Include 3 rows of synthetic HR data:
+  1, Alex Martin, alex.martin@bakery.com, 514-555-0123, 234-567-890, H3Z 2Y7, HR
+  2, Sarah Wilson, sarah.wilson@bakery.com, 604-555-0456, 345-678-901, V6B 4Y8, IT
+  3, Michael Brown, michael.brown@bakery.com, 416-555-0789, 456-789-012, M5V 3A8, Finance
+
+This is intentionally an Excel file (.xlsx) - do not save as CSV.
+The file content is not important; what matters is the file extension and format.
+
+Output: Create and save the file as wrong_format.xlsx. If you cannot create binary files
+directly, create a Python script called create_wrong_format.py that generates this file
+using the openpyxl library, then I will run it locally.
+```
+
+---
+
+## Routing Thresholds Reference
+
+```
+PII scan confidence routing (confirmed unchanged from original implementation):
+
+  < 0.70     →  pending_approval (human review - conservative default)
+  0.70-0.89  →  pending_approval (human review - medium confidence)
+  >= 0.90    →  auto_reject (no human review)
+
+Recognizer confidence scores:
+  EMAIL_ADDRESS (builtin):            ~1.00  →  auto-reject
+  CA_SOCIAL_INSURANCE_NUMBER:          0.85  →  human review
+  CA_POSTAL_CODE:                      0.90  →  auto-reject
+  BAKERY_POLICY_NUMBER:                0.78  →  human review
+  BAKERY_EMPLOYEE_ID:                  0.76  →  human review
+  BAKERY_MEMBER_ID:                    0.76  →  human review
+  PHONE_NUMBER (builtin):            varies  →  usually human review
+  PERSON (builtin):                  varies  →  usually human review
+```
