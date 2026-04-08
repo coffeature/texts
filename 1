@@ -1,0 +1,22 @@
+Create a JSON schema file for the DAPortal SchemaDriven pipeline.
+
+File name: no_pii_clean.schema.json
+
+This schema file accompanies a product catalog CSV called no_pii_clean.csv.
+The CSV has these columns: product_code, category, unit_price_cad, stock_count, warehouse_zone, last_updated.
+None of these columns contain personal information.
+
+The DAPortal schema file format is:
+{
+  "format": "csv",
+  "columns": [
+    { "columnName": "<name>", "piiType": "<taxonomy value or empty string>" }
+  ]
+}
+
+For columns with no PII, set piiType to empty string "".
+Valid pllType values are from the following taxonomy:
+skdjfhkjsfh
+
+Include all 6 columns in the schema. All should have piiType "".
+Output only the JSON file content, no explanation.
