@@ -1,0 +1,15 @@
+Centralized masking rules – Single governance_masking_rules.json with piiTypeRules; one source of truth for all masking decisions.
+
+Configurable rules (Data Governance) – Governance owns and edits the JSON in blob storage; no code changes or deployments required.
+
+Configurable strategies (Data Governance) – piiTypeRules define strategy per PII type (redact, hash, tokenize, etc.); governance can change strategies in the JSON and upload.
+
+No column-name-based rules – Rules are keyed by PII type only; same treatment for email, user_email, contact_email, etc.; works with any column names.
+
+Contoso compliance – Rules schema supports policy alignment; PII types align with Canada Life taxonomy; governance metadata is captured in the rules file.
+
+Multi-team, diverse datasets – One rule set for all teams; uploader metadata maps columns to PII types; no per-dataset or per-team rule files.
+
+Uploader responsible for classification – Uploader provides piiType per column in metadata; PII scan validates and flags misclassification; post-mask scan acts as a safety net.
+
+Approval only for exceptions – Clean uploads (no PII findings) auto-approve; human approval only when the scan flags residual PII or ambiguous findings; no approval bottleneck for routine uploads.
