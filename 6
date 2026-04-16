@@ -1,0 +1,419 @@
+# Masking Process - Metadata + PII Type Model
+
+## Executive summary
+
+This masking design uses **centralized control with uploader-provided classification**.
+
+The uploader does **not** choose the masking strategy directly.
+Instead, the uploader classifies each column with a **PII type** in metadata, and the system applies the masking strategy defined by Governance for that PII type.
+
+So the decision chain is:
+
+**column name in CSV -> piiType from metadata -> masking strategy from governance rules -> masked output**
+
+Example:
+
+* `email` -> `EMAIL_ADDRESS` -> `hash` -> hashed value in the masked file
+* `customer_name` -> `PERSON` -> `redact` -> `[REDACTED]`
+
+---
+
+## What happens end to end
+
+### Step 1. File and metadata arrive
+
+For each upload, the uploader provides:
+
+1. **Data file** - the CSV
+2. **Metadata JSON** - lists columns and assigns a `piiType` to each column
+
+Example metadata structure:
+
+```json
+{
+  "columns": [
+    {"columnName": "customer_name", "piiType": "PERSON"},
+    {"columnName": "policy_number", "piiType": "CA_POLICY_NUMBER"},
+    {"columnName": "member_id", "piiType": "CA_MEMBER_ID"},
+    {"columnName": "email", "piiType": "EMAIL_ADDRESS"},
+    {"columnName": "claim_amount", "piiType": null},
+    {"columnName": "policy_type", "piiType": null}
+  ]
+}
+```
+
+The uploader is responsible for making sure the classification is correct.
+
+---
+
+### Step 2. System loads centralized governance masking rules
+
+The system reads a centrally managed JSON file, shown in the slides as:
+
+* **Location:** Azure Blob Storage, `masking-rules/` container
+* **File:** `governance_masking_rules.json`
+
+This file maps **PII type -> strategy**.
+
+Example:
+
+```json
+{
+  "piiTypeRules": [
+    {"piiType": "PERSON", "strategy": "redact", "params": {"replacement": "[REDACTED]"}},
+    {"piiType": "CA_POLICY_NUMBER", "strategy": "redact"},
+    {"piiType": "CA_MEMBER_ID", "strategy": "hash"},
+    {"piiType": "EMAIL_ADDRESS", "strategy": "hash"}
+  ]
+}
+```
+
+Important point:
+
+* Governance defines rules **by PII type**, not by column name.
+* That means different column names like `email`, `user_email`, or `contact_email` can all receive the same treatment if they are classified as `EMAIL_ADDRESS`.
+
+---
+
+### Step 3. The system applies masking column by column
+
+For each CSV column, the logic is:
+
+1. Read the column name
+2. Find that column in metadata
+3. Get the assigned `piiType`
+4. Look up the governance rule for that `piiType`
+5. Apply the masking strategy
+
+The slide describes it like this:
+
+**For each CSV column, find metadata by `columnName` -> get `piiType` -> lookup `governance.piiTypeRules[piiType]` -> apply strategy.**
+
+Example result:
+
+| Column          | Metadata piiType   | Governance rule | Output              |
+| --------------- | ------------------ | --------------- | ------------------- |
+| `customer_name` | `PERSON`           | `redact`        | `[REDACTED]`        |
+| `policy_number` | `CA_POLICY_NUMBER` | `redact`        | `[REDACTED]`        |
+| `member_id`     | `CA_MEMBER_ID`     | `hash`          | hashed value        |
+| `email`         | `EMAIL_ADDRESS`    | `hash`          | hashed value        |
+| `claim_amount`  | no piiType         | `retain`        | original value kept |
+| `policy_type`   | no piiType         | `retain`        | original value kept |
+
+Notes shown in the slides:
+
+* **Any masking failure blocks progression**
+* **Missing metadata or invalid `piiType` triggers rejection**
+* **Unmapped columns default to retain** as a conservative system behavior shown on the slide
+
+---
+
+### Step 4. Create the masked file
+
+After masking:
+
+* a new masked CSV is created
+* the original unmasked file is deleted from staging
+* the pipeline continues to approval or delivery
+
+The slide explicitly says:
+
+* original unmasked file deleted
+* PII scan validates masked output as a safety net
+* pipeline continues to approval/delivery
+
+This is described as **static masking**:
+
+* masking happens once at ingestion
+* original PII is not retained in staging
+* there is **no query-time or reversible masking** in this design
+
+---
+
+## Where PII detection fits
+
+Masking is **not the only control**.
+There is also a **PII detection scan** that acts as a safety net.
+
+The slides describe it as pattern-based detection using **Microsoft Presidio**, extended with custom Canadian recognizers.
+
+Examples mentioned:
+
+* SIN
+* postal codes
+* provincial patterns
+* health card numbers
+
+The scan produces a confidence score and routes the file:
+
+* **>= 90% confidence** -> auto-reject
+* **70-89% confidence** -> human review
+* **< 70% confidence** -> human review, conservative check
+* **No PII found** -> auto-approve
+
+So the intent is:
+
+* **metadata-driven masking** does the primary masking work
+* **PII detection** checks whether anything sensitive still remains or whether something ambiguous was found
+
+This is why the slides say governance approval should be required only for **exceptions**, not for every upload.
+
+---
+
+## How many files are needed?
+
+## A. Files needed for each upload
+
+For a normal upload, the uploader needs to provide **2 files every time**:
+
+1. **Input CSV** - the actual data file
+2. **Metadata JSON** - the column classification file with `columnName` and `piiType`
+
+So the normal per-upload answer is:
+
+**2 uploader-supplied files per dataset upload**
+
+---
+
+## B. Central configuration files needed for the system to work
+
+In addition to those upload files, the platform needs centrally maintained configuration.
+
+### 1. `governance_masking_rules.json`
+
+Purpose:
+
+* defines **which masking strategy applies to each PII type**
+
+Examples from the slides:
+
+* `PERSON` -> `redact`
+* `EMAIL_ADDRESS` -> `hash`
+* `CA_MEMBER_ID` -> `hash`
+* `CA_POLICY_NUMBER` -> `redact`
+
+It may also contain parameters, for example a replacement string for redaction.
+
+This is maintained **rarely**, when Governance wants to change masking behavior.
+
+Examples of changes:
+
+* switch `CA_MEMBER_ID` from `hash` to `redact`
+* change redaction replacement text
+* add a new PII type strategy
+
+---
+
+### 2. `pii_config.json`
+
+Purpose:
+
+* defines **what the PII detection engine should look for**
+* includes detection patterns, sensitivity levels, context words, and confidence settings
+
+The slide shows fields like:
+
+* `entityType`
+* `displayName`
+* `sensitivity`
+* `pattern`
+* `contextWords`
+* `confidenceScore`
+* `enabled`
+
+Example use cases from the slides:
+
+* add RAMQ health card pattern for Quebec data
+* change regex for a policy number format
+* lower sensitivity or disable a rule if too many false positives occur
+
+This is also maintained **rarely**, when Governance wants to tune detection behavior.
+
+---
+
+## C. Optional but important reference artifact
+
+### 3. PII type taxonomy / allowed list
+
+The slides include a list of approved PII types such as:
+
+* `PERSON`
+* `EMAIL_ADDRESS`
+* `PHONE_NUMBER`
+* `CREDIT_CARD`
+* `LOCATION`
+* `CA_SOCIAL_INSURANCE_NUMBER`
+* `CA_POSTAL_CODE`
+* `CA_POLICY_NUMBER`
+* `CA_EMPLOYEE_ID`
+* `CA_MEMBER_ID`
+
+This looks like a **governance-approved taxonomy** that uploaders should use in metadata.
+
+Strictly speaking, this may be a reference standard rather than a separate runtime file, but operationally it is important because:
+
+* metadata must use valid PII types
+* masking rules are keyed by those PII types
+* invalid or unknown PII types can cause rejection
+
+---
+
+## Minimal file count summary
+
+### Per upload
+
+* **1 CSV**
+* **1 metadata JSON**
+
+### Central platform configuration
+
+* **1 masking rules JSON**: `governance_masking_rules.json`
+* **1 PII detection config JSON**: `pii_config.json`
+
+### Practical answer
+
+At minimum, the process depends on:
+
+* **2 files per upload** from the uploader
+* **2 centrally managed configuration files** already present in the platform
+
+So in practice the full setup is:
+
+* **Per upload:** 2 files
+* **System baseline:** 2 core config files
+
+---
+
+## What exactly is configurable rarely?
+
+There are **two main rare-change rule sets**.
+
+### 1. Masking rules
+
+Stored in `governance_masking_rules.json`
+
+Governance controls:
+
+* masking strategy per PII type
+* strategy parameters
+
+Examples:
+
+* redact
+* hash
+* retain
+* tokenization, if introduced later
+* replacement string like `[REDACTED]`
+
+Governance does **not** control:
+
+* which physical column names in a specific file contain PII
+* that is supplied by the uploader in metadata
+
+---
+
+### 2. Detection rules
+
+Stored in `pii_config.json`
+
+Governance controls:
+
+* which PII entities to detect
+* regex or other patterns
+* confidence score defaults
+* sensitivity levels such as HIGH / MEDIUM / LOW
+* context words
+* enabled/disabled state
+* routing thresholds used by the detection process
+
+Examples:
+
+* Canadian SIN pattern
+* provincial health card patterns
+* postal code logic
+* policy number pattern updates
+
+---
+
+## Who is responsible for what?
+
+### Uploader
+
+Responsible for:
+
+* sending the CSV
+* sending metadata
+* correctly classifying columns with valid PII types
+
+### Governance
+
+Responsible for:
+
+* defining the approved PII taxonomy
+* defining masking strategy per PII type
+* defining detection patterns and sensitivity rules
+* updating configuration when policy changes
+
+### Data airlock / system
+
+Responsible for:
+
+* reading metadata
+* loading governance rules
+* applying masking automatically
+* creating masked output
+* deleting original unmasked staged file
+* running PII detection as a safety net
+* routing exceptions to human review
+
+---
+
+## Why this design is recommended
+
+The slides call this option **recommended** for a few clear reasons:
+
+* it satisfies governance requirements
+* it scales across many datasets because rules are tied to **PII type**, not fragile column names
+* it is consistent across teams
+* rule changes can happen through JSON configuration, without code deployment
+* detection adds a second layer of protection if uploaders misclassify something
+
+---
+
+## Main risks and trade-offs
+
+The slides also show the main downside clearly:
+
+* the uploader must classify every column
+* quality depends on uploader diligence
+* under-classification is possible
+* wrong `piiType` assignment can lead to the wrong masking strategy
+
+Example risk:
+
+* a column is classified incorrectly as `PERSON` instead of `EMAIL_ADDRESS`
+* the wrong masking method is applied
+
+Mitigation in the design:
+
+* post-mask PII scan
+* rejection or human review for suspicious output
+* centralized governance control over rules
+
+---
+
+## Simple answer you can reuse
+
+For this masking model to work:
+
+* **Every upload needs 2 files:**
+
+  * the **CSV**
+  * a **metadata JSON** with `columnName` and `piiType`
+
+* The platform also depends on central configuration that is updated only occasionally:
+
+  * **`governance_masking_rules.json`** for **PII type -> masking strategy**
+  * **`pii_config.json`** for **PII detection patterns, sensitivity, and routing**
+
+So the uploader sends **2 files each time**, while Governance maintains **2 main configuration files** behind the scenes.
